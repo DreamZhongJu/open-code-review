@@ -2,6 +2,7 @@
 
 const path = require("path");
 const fs = require("fs");
+const os = require("os");
 
 const IS_WINDOWS = process.platform === "win32";
 const BINARY_FILENAME = IS_WINDOWS ? "opencodereview.exe" : "opencodereview";
@@ -40,7 +41,7 @@ function resolveNativeBinary() {
       const pkgDir = path.dirname(require.resolve(`${pkgName}/package.json`));
       const binPath = path.join(pkgDir, "bin", BINARY_FILENAME);
       if (fs.existsSync(binPath)) {
-        return { path: binPath, fromPlatformPkg: true };
+        return { path: binPath, fromPlatformPkg: true, fromCache: false };
       }
     } catch (err) {
       if (err.code !== "MODULE_NOT_FOUND") {
@@ -51,7 +52,14 @@ function resolveNativeBinary() {
 
   const legacyPath = path.join(__dirname, "..", "bin", BINARY_FILENAME);
   if (fs.existsSync(legacyPath)) {
-    return { path: legacyPath, fromPlatformPkg: false };
+    return { path: legacyPath, fromPlatformPkg: false, fromCache: false };
+  }
+
+  const cachePath = path.join(
+    os.homedir(), ".opencodereview", "bin", BINARY_FILENAME
+  );
+  if (fs.existsSync(cachePath)) {
+    return { path: cachePath, fromPlatformPkg: false, fromCache: true };
   }
 
   return null;

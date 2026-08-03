@@ -15,6 +15,7 @@ const tsFile = path.join(stateDir, "last-update-check");
 const lockFile = path.join(stateDir, "update.lock");
 const hintFile = path.join(stateDir, "update-available");
 
+const CACHE_BIN_DIR = path.join(stateDir, "bin");
 const DEFAULT_REGISTRY = "https://registry.npmjs.org";
 
 function touchTimestamp() {
@@ -136,6 +137,19 @@ function removeHint() {
   } catch (_) {}
 }
 
+function cacheBinary(srcPath) {
+  try {
+    fs.mkdirSync(CACHE_BIN_DIR, { recursive: true });
+    const dest = path.join(CACHE_BIN_DIR, path.basename(srcPath));
+    const tmp = dest + ".tmp";
+    fs.copyFileSync(srcPath, tmp);
+    fs.renameSync(tmp, dest);
+    if (process.platform !== "win32") {
+      fs.chmodSync(dest, 0o755);
+    }
+  } catch (_) {}
+}
+
 async function main() {
   touchTimestamp();
 
@@ -159,6 +173,8 @@ async function main() {
       return;
     }
 
+    cacheBinary(resolved.path);
+
     const pkgName = pkg.name;
     const IS_WINDOWS = process.platform === "win32";
     const result = spawnSync("npm", ["i", "-g", `${pkgName}@${latestVersion}`], {
@@ -169,6 +185,10 @@ async function main() {
 
     if (result.status === 0) {
       removeHint();
+      const newResolved = resolveNativeBinary();
+      if (newResolved && !newResolved.fromCache) {
+        cacheBinary(newResolved.path);
+      }
     } else {
       writeHint(latestVersion, pkgName);
     }
