@@ -154,6 +154,10 @@ type Args struct {
 	// defines one. Set via the --no-filter CLI flag.
 	SkipFilter bool
 
+	// SummaryEnabled enables the post-run PROJECT_SUMMARY_TASK that consolidates
+	// all per-file comments into a project-level summary. Set via --summary.
+	SummaryEnabled bool
+
 	// RuntimeConfig carries the non-secret, allowlisted runtime settings that
 	// identify how this run was configured, for the manifest's
 	// runtime_config_sha256. It is populated by the cmd layer from the resolved
@@ -189,6 +193,7 @@ type Agent struct {
 	runner          *llmloop.Runner
 	resumeInfo      *ResumeInfo
 	budgetExceeded  bool // set when a token/tool-call budget gate stopped dispatch
+	projectSummary  string
 
 	// inputResolution holds this run's frozen commit endpoints (resolved_base/
 	// head/exact_range), and repoRemoteIdentity the credential-free repository
@@ -376,6 +381,10 @@ func (a *Agent) Run(ctx context.Context) ([]model.LlmComment, error) {
 	if len(comments) > 0 {
 		telemetry.RecordCommentsGenerated(ctx, int64(len(comments)))
 	}
+
+	// Step 3: Generate project-level summary if enabled.
+	a.maybeRunProjectSummary(ctx, comments)
+
 	// Join background memory compression before anything freezes run-level
 	// state. Those jobs are cancelled rather than awaited when a conversation
 	// ends, so their LLM request can still be in flight here; a retry report
@@ -462,10 +471,9 @@ func (a *Agent) TotalCacheReadTokens() int64 { return a.runner.TotalCacheReadTok
 // TotalCacheWriteTokens returns the accumulated cache write tokens from all LLM calls.
 func (a *Agent) TotalCacheWriteTokens() int64 { return a.runner.TotalCacheWriteTokens() }
 
-// ProjectSummary returns the markdown project-level summary. Always empty
-// for the diff-review path; defined so *Agent satisfies the
-// cmd/opencodereview.ResultProvider interface that scan.Agent also implements.
-func (a *Agent) ProjectSummary() string { return "" }
+// ProjectSummary returns the markdown project-level summary generated when
+// --summary is enabled. Empty when summary is disabled or no comments were produced.
+func (a *Agent) ProjectSummary() string { return a.projectSummary }
 
 // Warnings returns a copy of non-fatal warnings recorded during review.
 func (a *Agent) Warnings() []AgentWarning { return a.runner.Warnings() }
@@ -1896,4 +1904,83 @@ func BuildToolDefs(entries []toolsconfig.ToolConfigEntry, planOnly bool) []llm.T
 		})
 	}
 	return defs
+}
+
+// maybeRunProjectSummary runs the PROJECT_SUMMARY_TASK over the collected
+// comments when --summary is enabled. Best-effort: any error or empty input
+// silently leaves projectSummary unset.
+func (a *Agent) maybeRunProjectSummary(ctx context.Context, comments []model.LlmComment) {
+	if !a.args.SummaryEnabled {
+		return
+	}
+	pt := a.args.Template.ProjectSummaryTask
+	if pt == nil || len(pt.Messages) == 0 {
+		return
+	}
+	if len(comments) == 0 {
+		return
+	}
+	if ctx.Err() != nil || a.budgetExceeded {
+		return
+	}
+
+	fileSet := make(map[string]struct{}, len(comments))
+	for _, c := range comments {
+		fileSet[c.Path] = struct{}{}
+	}
+	payload := buildSummaryCommentsList(comments)
+
+	messages := make([]llm.Message, 0, len(pt.Messages))
+	for _, m := range pt.Messages {
+		content := m.Content
+		content = strings.ReplaceAll(content, "{{comment_count}}", fmt.Sprintf("%d", len(comments)))
+		content = strings.ReplaceAll(content, "{{file_count}}", fmt.Sprintf("%d", len(fileSet)))
+		content = strings.ReplaceAll(content, "{{all_comments}}", payload)
+		messages = append(messages, llm.NewTextMessage(m.Role, content))
+	}
+
+	const pathKey = "__review_project_summary__"
+	fs := a.session.GetOrCreateFileSession(pathKey)
+	rec := fs.AppendTaskRecord(session.MemoryCompressionTask, messages)
+	ctx = llm.ContextWithSessionKey(ctx,
+		llm.SessionTaskKey(a.session.SessionID, string(session.MemoryCompressionTask), pathKey))
+	startTime := time.Now()
+
+	resp, err := a.args.LLMClient.CompletionsWithCtx(ctx, llm.ChatRequest{
+		Model:     a.args.Model,
+		Messages:  messages,
+		MaxTokens: a.args.Template.CompletionTokenLimit(),
+	})
+	if err != nil {
+		rec.SetError(err, time.Since(startTime))
+		fmt.Fprintf(stdout.Writer(), "[ocr] project summary failed: %v\n", err)
+		return
+	}
+	rec.SetResponse(resp, time.Since(startTime))
+	a.runner.RecordUsage(resp.Usage)
+
+	body := strings.TrimSpace(llmloop.StripMarkdownFences(resp.Content()))
+	if body == "" {
+		return
+	}
+	a.projectSummary = body
+}
+
+// buildSummaryCommentsList renders comments as a compact path-anchored
+// markdown list for embedding in the PROJECT_SUMMARY_TASK prompt.
+func buildSummaryCommentsList(comments []model.LlmComment) string {
+	const maxRunes = 280
+	var sb strings.Builder
+	for _, c := range comments {
+		sb.WriteString("- `")
+		sb.WriteString(c.Path)
+		sb.WriteString("`: ")
+		oneLine := strings.ReplaceAll(c.Content, "\n", " ")
+		if r := []rune(oneLine); len(r) > maxRunes {
+			oneLine = string(r[:maxRunes]) + "..."
+		}
+		sb.WriteString(oneLine)
+		sb.WriteString("\n")
+	}
+	return sb.String()
 }
