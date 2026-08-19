@@ -954,3 +954,155 @@ func TestClassifyMainLoopStop(t *testing.T) {
 		})
 	}
 }
+
+func TestMaybeRunProjectSummary_Success(t *testing.T) {
+	summaryText := "The codebase has consistent error handling but lacks input validation."
+	client := &fakeAgentClient{
+		responses: []*llm.ChatResponse{{
+			Choices: []llm.Choice{{Message: llm.ResponseMessage{Content: &summaryText}}},
+			Usage:   &llm.UsageInfo{PromptTokens: 200, CompletionTokens: 80},
+		}},
+	}
+
+	sess := session.New(t.TempDir(), "main", "test", session.SessionOptions{ReviewMode: "diff"})
+	a := New(Args{
+		LLMClient:        client,
+		Model:            "test",
+		SummaryEnabled:   true,
+		CommentCollector: tool.NewCommentCollector(),
+		Tools:            tool.NewRegistry(),
+		Session:          sess,
+		Template: template.Template{
+			MaxTokens:           10000,
+			MaxToolRequestTimes: 5,
+			MainTask:            template.LlmConversation{Messages: []template.ChatMessage{{Role: "user", Content: "t"}}},
+			ProjectSummaryTask: &template.LlmConversation{
+				Messages: []template.ChatMessage{
+					{Role: "user", Content: "Summarize {{comment_count}} comments across {{file_count}} files:\n{{all_comments}}"},
+				},
+			},
+		},
+	})
+
+	comments := []model.LlmComment{
+		{Path: "a.go", Content: "missing error check"},
+		{Path: "b.go", Content: "no input validation"},
+	}
+
+	a.maybeRunProjectSummary(context.Background(), comments)
+
+	if a.ProjectSummary() != summaryText {
+		t.Errorf("ProjectSummary() = %q, want %q", a.ProjectSummary(), summaryText)
+	}
+	if client.calls != 1 {
+		t.Errorf("expected 1 LLM call, got %d", client.calls)
+	}
+}
+
+func TestMaybeRunProjectSummary_SkipWhenDisabled(t *testing.T) {
+	client := &fakeAgentClient{}
+	sess := session.New(t.TempDir(), "main", "test", session.SessionOptions{ReviewMode: "diff"})
+	a := New(Args{
+		LLMClient:        client,
+		Model:            "test",
+		SummaryEnabled:   false,
+		CommentCollector: tool.NewCommentCollector(),
+		Tools:            tool.NewRegistry(),
+		Session:          sess,
+		Template: template.Template{
+			MaxTokens:           10000,
+			MaxToolRequestTimes: 5,
+			MainTask:            template.LlmConversation{Messages: []template.ChatMessage{{Role: "user", Content: "t"}}},
+			ProjectSummaryTask: &template.LlmConversation{
+				Messages: []template.ChatMessage{{Role: "user", Content: "{{all_comments}}"}},
+			},
+		},
+	})
+
+	a.maybeRunProjectSummary(context.Background(), []model.LlmComment{
+		{Path: "a.go", Content: "something"},
+	})
+
+	if a.ProjectSummary() != "" {
+		t.Errorf("ProjectSummary() = %q, want empty when SummaryEnabled is false", a.ProjectSummary())
+	}
+	if client.calls != 0 {
+		t.Errorf("expected 0 LLM calls when disabled, got %d", client.calls)
+	}
+}
+
+func TestMaybeRunProjectSummary_SkipWhenNoComments(t *testing.T) {
+	client := &fakeAgentClient{}
+	sess := session.New(t.TempDir(), "main", "test", session.SessionOptions{ReviewMode: "diff"})
+	a := New(Args{
+		LLMClient:        client,
+		Model:            "test",
+		SummaryEnabled:   true,
+		CommentCollector: tool.NewCommentCollector(),
+		Tools:            tool.NewRegistry(),
+		Session:          sess,
+		Template: template.Template{
+			MaxTokens:           10000,
+			MaxToolRequestTimes: 5,
+			MainTask:            template.LlmConversation{Messages: []template.ChatMessage{{Role: "user", Content: "t"}}},
+			ProjectSummaryTask: &template.LlmConversation{
+				Messages: []template.ChatMessage{{Role: "user", Content: "{{all_comments}}"}},
+			},
+		},
+	})
+
+	a.maybeRunProjectSummary(context.Background(), nil)
+
+	if a.ProjectSummary() != "" {
+		t.Errorf("ProjectSummary() = %q, want empty when no comments", a.ProjectSummary())
+	}
+	if client.calls != 0 {
+		t.Errorf("expected 0 LLM calls with no comments, got %d", client.calls)
+	}
+}
+
+func TestBuildSummaryCommentsList(t *testing.T) {
+	t.Run("basic format", func(t *testing.T) {
+		comments := []model.LlmComment{
+			{Path: "main.go", Content: "missing nil check"},
+			{Path: "handler.go", Content: "unused import"},
+		}
+		got := buildSummaryCommentsList(comments)
+		if !strings.Contains(got, "- `main.go`: missing nil check") {
+			t.Errorf("expected path-anchored entry for main.go, got:\n%s", got)
+		}
+		if !strings.Contains(got, "- `handler.go`: unused import") {
+			t.Errorf("expected path-anchored entry for handler.go, got:\n%s", got)
+		}
+	})
+
+	t.Run("newlines flattened", func(t *testing.T) {
+		comments := []model.LlmComment{
+			{Path: "a.go", Content: "line1\nline2\nline3"},
+		}
+		got := buildSummaryCommentsList(comments)
+		if strings.Contains(got, "\n- ") && strings.Count(got, "\n") > 1 {
+			t.Errorf("multi-line comment should be flattened to one line, got:\n%s", got)
+		}
+		if !strings.Contains(got, "line1 line2 line3") {
+			t.Errorf("newlines should become spaces, got:\n%s", got)
+		}
+	})
+
+	t.Run("truncation at 280 runes", func(t *testing.T) {
+		long := strings.Repeat("あ", 300)
+		comments := []model.LlmComment{
+			{Path: "x.go", Content: long},
+		}
+		got := buildSummaryCommentsList(comments)
+		if !strings.Contains(got, "...") {
+			t.Error("long content should be truncated with ellipsis")
+		}
+		line := strings.TrimPrefix(got, "- `x.go`: ")
+		line = strings.TrimSuffix(line, "\n")
+		runes := []rune(line)
+		if len(runes) > 284 { // 280 + "..."
+			t.Errorf("truncated line too long: %d runes", len(runes))
+		}
+	})
+}
