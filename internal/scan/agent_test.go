@@ -359,3 +359,16 @@ func TestTokenCountersDelegateToRunner(t *testing.T) {
 	}
 	_ = llmloop.AgentWarning{} // keep llmloop import meaningful
 }
+
+func TestScanAgent_WaitBackground_NoLeakOnRun(t *testing.T) {
+	client := &identityProbeClient{reply: "no findings"}
+	a := newProbeAgent(t, makeTemplateWithFullScan(), client, nil)
+	a.args.RepoDir = t.TempDir() // empty dir so 0 files discovered -> clean skip
+	comments, err := a.Run(t.Context())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(comments) != 0 {
+		t.Fatalf("expected 0 comments, got %d", len(comments))
+	}
+}

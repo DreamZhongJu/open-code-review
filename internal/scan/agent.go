@@ -372,6 +372,12 @@ func (a *Agent) Run(ctx context.Context) ([]model.LlmComment, error) {
 	// Project-level summary runs after all batches; never blocks return.
 	a.maybeRunProjectSummary(ctx, comments)
 
+	// Join background memory compression before anything finalizes the session.
+	// Those jobs are cancelled rather than awaited when a conversation ends, so
+	// their LLM request can still be in flight here; joining them ensures no
+	// background goroutine is left leaking or writing to a finalized session.
+	a.runner.WaitBackground()
+
 	// A persistence failure is a delivery error in its own right: when the scan
 	// also failed, both facts are reported (errors.Join) rather than letting the
 	// dispatch error hide the fact that session_end never reached disk.
