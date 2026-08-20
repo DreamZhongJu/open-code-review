@@ -382,8 +382,15 @@ func (a *Agent) Run(ctx context.Context) ([]model.LlmComment, error) {
 		telemetry.RecordCommentsGenerated(ctx, int64(len(comments)))
 	}
 
-	// Step 3: Generate project-level summary if enabled.
-	a.maybeRunProjectSummary(ctx, comments)
+	// Step 3: Generate project-level summary if enabled. Skipped when dispatch
+	// returned a hard error: a summary is a read of results the run failed to
+	// produce, so spending another request on it buys nothing. Both of today's
+	// error paths (cancellation, every file failed) would also be caught by the
+	// ctx / empty-comments guards inside, but gating here keeps the rule where
+	// the error is actually visible.
+	if err == nil {
+		a.maybeRunProjectSummary(ctx, comments)
+	}
 
 	// Join background memory compression before anything freezes run-level
 	// state. Those jobs are cancelled rather than awaited when a conversation
@@ -1908,7 +1915,10 @@ func BuildToolDefs(entries []toolsconfig.ToolConfigEntry, planOnly bool) []llm.T
 
 // maybeRunProjectSummary runs the PROJECT_SUMMARY_TASK over the collected
 // comments when --summary is enabled. Best-effort: any error or empty input
-// silently leaves projectSummary unset.
+// leaves projectSummary unset. A failure is recorded as a warning rather than
+// only printed, because the machine-readable paths this run may be feeding
+// (--format json, --audience agent) have stdout replaced by io.Discard, and a
+// summary the user paid for and did not get must not vanish silently.
 func (a *Agent) maybeRunProjectSummary(ctx context.Context, comments []model.LlmComment) {
 	if !a.args.SummaryEnabled {
 		return
@@ -1924,10 +1934,19 @@ func (a *Agent) maybeRunProjectSummary(ctx context.Context, comments []model.Llm
 		return
 	}
 
+	// Span starts after the gates, not before them like review_filter's: the
+	// filter is on by default and its skip is worth seeing in a trace, whereas
+	// --summary is off by default, so an earlier span would add an empty
+	// project_summary.execute to every ordinary review.
+	ctx, span := telemetry.StartSpan(ctx, "project_summary.execute")
+	defer span.End()
+	telemetry.SetAttr(span, "comments.total", len(comments))
+
 	fileSet := make(map[string]struct{}, len(comments))
 	for _, c := range comments {
 		fileSet[c.Path] = struct{}{}
 	}
+	telemetry.SetAttr(span, "files.total", len(fileSet))
 	payload := buildSummaryCommentsList(comments)
 
 	messages := make([]llm.Message, 0, len(pt.Messages))
@@ -1940,27 +1959,51 @@ func (a *Agent) maybeRunProjectSummary(ctx context.Context, comments []model.Llm
 	}
 
 	const pathKey = "__review_project_summary__"
+	// MemoryCompressionTask is borrowed as the record's task type: the summary is
+	// a run-level task with no TaskType of its own, and pathKey already keeps its
+	// records and cache key out of every real file's namespace.
 	fs := a.session.GetOrCreateFileSession(pathKey)
 	rec := fs.AppendTaskRecord(session.MemoryCompressionTask, messages)
 	ctx = llm.ContextWithSessionKey(ctx,
 		llm.SessionTaskKey(a.session.SessionID, string(session.MemoryCompressionTask), pathKey))
 	startTime := time.Now()
+	// Request identity, same as every other LLM call on this path: without it the
+	// retry observer drops the request and this call's retries and failures never
+	// reach the run's retry report.
+	reqCtx := llm.WithRequestMeta(ctx, a.newRequestMeta(pathKey, session.MemoryCompressionTask, rec.RequestNo))
 
-	resp, err := a.args.LLMClient.CompletionsWithCtx(ctx, llm.ChatRequest{
+	_, llmSpan := telemetry.StartLLMSpan(ctx, a.args.Model)
+	resp, err := a.args.LLMClient.CompletionsWithCtx(reqCtx, llm.ChatRequest{
 		Model:     a.args.Model,
 		Messages:  messages,
 		MaxTokens: a.args.Template.CompletionTokenLimit(),
 	})
+	duration := time.Since(startTime)
 	if err != nil {
-		rec.SetError(err, time.Since(startTime))
+		telemetry.RecordLLMResult(llmSpan, duration, 0, err)
+		llmSpan.End()
+		rec.SetError(err, duration)
 		fmt.Fprintf(stdout.Writer(), "[ocr] project summary failed: %v\n", err)
+		a.recordWarning("project_summary_error", "", err.Error())
+		span.SetStatus(codes.Error, err.Error())
+		span.RecordError(err)
 		return
 	}
-	rec.SetResponse(resp, time.Since(startTime))
+	var totalTokens int64
+	if resp.Usage != nil {
+		totalTokens = resp.Usage.TotalTokens
+	}
+	telemetry.RecordLLMResult(llmSpan, duration, totalTokens, nil)
+	llmSpan.End()
+	rec.SetResponse(resp, duration)
 	a.runner.RecordUsage(resp.Usage)
 
 	body := strings.TrimSpace(llmloop.StripMarkdownFences(resp.Content()))
 	if body == "" {
+		// An empty body is a silent hole in machine-readable output just as a
+		// transport error is, so it is reported the same way.
+		a.recordWarning("project_summary_error", "", "model returned an empty summary")
+		telemetry.SetAttr(span, "summary.empty", true)
 		return
 	}
 	a.projectSummary = body
