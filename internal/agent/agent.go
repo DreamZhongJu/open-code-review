@@ -1968,6 +1968,12 @@ func (a *Agent) maybeRunProjectSummary(ctx context.Context, comments []model.Llm
 
 // buildSummaryCommentsList renders comments as a compact path-anchored
 // markdown list for embedding in the PROJECT_SUMMARY_TASK prompt.
+//
+// The cap counts runes, not bytes: slicing a byte at a time would cut a
+// multibyte character in half, putting invalid UTF-8 into the prompt, and
+// would spend the budget three times too fast on CJK content — 280 bytes
+// holds only 93 characters of it. internal/scan has its own copy of this
+// function; keep the two in step.
 func buildSummaryCommentsList(comments []model.LlmComment) string {
 	const maxRunes = 280
 	var sb strings.Builder
