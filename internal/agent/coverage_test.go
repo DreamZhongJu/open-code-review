@@ -1090,7 +1090,7 @@ func TestBuildSummaryCommentsList(t *testing.T) {
 	})
 
 	t.Run("truncation at 280 runes", func(t *testing.T) {
-		long := strings.Repeat("あ", 300)
+		long := strings.Repeat("あ", 300) // allow-non-english: fixture exercises multibyte truncation
 		comments := []model.LlmComment{
 			{Path: "x.go", Content: long},
 		}
