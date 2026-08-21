@@ -468,11 +468,11 @@ func TestScanAgent_WaitBackground_NoLeakOnRun(t *testing.T) {
 			{Type: "function", Function: llm.FunctionDef{Name: "code_comment"}},
 			{Type: "function", Function: llm.FunctionDef{Name: "task_done"}},
 		},
-		SkipPlan:         true,
-		SkipDedup:        true,
-		SkipSummary:      true,
-		MaxConcurrency:   1,
-		Session:          sess,
+		SkipPlan:       true,
+		SkipDedup:      true,
+		SkipSummary:    true,
+		MaxConcurrency: 1,
+		Session:        sess,
 	})
 
 	type runResult struct {
