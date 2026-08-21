@@ -383,11 +383,7 @@ func newBlockingScanCompressionClient() *blockingScanCompressionClient {
 func (c *blockingScanCompressionClient) CompletionsWithCtx(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
 	if len(req.Tools) == 0 {
 		c.once.Do(func() { close(c.started) })
-		select {
-		case <-c.release:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
+		<-c.release
 		summary := "compressed summary"
 		return &llm.ChatResponse{
 			Choices: []llm.Choice{{Message: llm.ResponseMessage{Content: &summary}}},
