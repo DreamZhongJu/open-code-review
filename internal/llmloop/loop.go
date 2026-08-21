@@ -118,8 +118,8 @@ func NewRunner(deps Deps) *Runner {
 // ultimately depends on the LLM client honouring context cancellation, and no
 // additional deadline is imposed here: the job already carries its own
 // timeout.
-// Scan does not currently call this because it freezes no retry report; its
-// analogous session-finalization race is outside this change.
+// Both diff-review and scan modes call this prior to session finalization so
+// background compression goroutines are joined before session_end is written.
 func (r *Runner) WaitBackground() {
 	r.bg.Wait()
 }
