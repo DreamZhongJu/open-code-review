@@ -416,6 +416,12 @@ func (c *blockingScanCompressionClient) CompletionsWithCtx(ctx context.Context, 
 		}, nil
 	}
 
+	// Round 2+: wait until the background compression goroutine has reached
+	// the mock (closed c.started) before returning task_done. This eliminates
+	// the race where the main loop finishes before compression starts,
+	// ensuring WaitBackground is the only thing holding Run open.
+	<-c.started
+
 	doneContent := ""
 	return &llm.ChatResponse{
 		Choices: []llm.Choice{{
@@ -489,11 +495,15 @@ func TestScanAgent_WaitBackground_NoLeakOnRun(t *testing.T) {
 		t.Fatal("timed out waiting for background compression to start")
 	}
 
-	// Verify that a.Run has NOT returned yet (held by a.runner.WaitBackground())
+	// Verify that a.Run has NOT returned yet (held by a.runner.WaitBackground()).
+	// Use a timeout rather than default: the main goroutine's entire post-loop
+	// cleanup (RunPerFile return → dispatchSubtasks → Finalize) completes in
+	// under 1ms on any machine, so 200ms is a generous upper bound. If Run
+	// returns within this window, WaitBackground is not holding it.
 	select {
 	case res := <-done:
 		t.Fatalf("a.Run returned prematurely before background compression was released: err=%v", res.err)
-	default:
+	case <-time.After(200 * time.Millisecond):
 	}
 
 	// Release compression and wait for Run to finish
