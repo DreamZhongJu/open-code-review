@@ -130,17 +130,34 @@ func TestInitializeRejectsOtherVersion(t *testing.T) {
 	}
 }
 
-func TestAuthenticateDeclaresNoAuth(t *testing.T) {
+func TestAuthenticateReturnsSuccessWithNoAuth(t *testing.T) {
 	h := newHarness(t, "mock")
 	h.initialize(t)
 	h.send(t, `{"jsonrpc":"2.0","id":9,"method":"authenticate","params":{}}`)
 	m := h.readMsg(t)
-	e, ok := m["error"].(map[string]any)
-	if !ok {
-		t.Fatalf("authenticate should answer explicitly without auth backend")
+	if _, hasErr := m["error"]; hasErr {
+		t.Fatalf("authenticate must succeed with an empty authMethods advertise, got error %v", m)
 	}
-	if s, _ := e["message"].(string); !strings.Contains(s, "no auth") {
-		t.Fatalf("message = %q", s)
+	if _, hasResult := m["result"]; !hasResult {
+		t.Fatalf("authenticate should carry an (empty) result object")
+	}
+}
+
+func TestInitializeAdvertisesAgentInfoAndCancellation(t *testing.T) {
+	h := newHarness(t, "mock")
+	h.send(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}`)
+	m := h.readMsg(t)
+	res := m["result"].(map[string]any)
+	ai, ok := res["agentInfo"].(map[string]any)
+	if !ok {
+		t.Fatalf("agentInfo missing: %v", res)
+	}
+	if ai["name"] != "ocr-acp" || ai["version"] == "" {
+		t.Fatalf("agentInfo shape wrong: %v", ai)
+	}
+	caps := res["agentCapabilities"].(map[string]any)
+	if rc, _ := caps["requestCancellation"].(bool); !rc {
+		t.Fatalf("requestCancellation should be true: %v", caps)
 	}
 }
 
@@ -171,18 +188,25 @@ func TestSessionNewPromptMockFlow(t *testing.T) {
 		if mID(m) == idNew {
 			res := m["result"].(map[string]any)
 			sid = res["sessionId"].(string)
-			cmds, _ := res["commands"].([]any)
-			if len(cmds) != 2 {
-				t.Fatalf("expected two builtin slash commands, got %d", len(cmds))
+			if _, hasCommands := res["commands"]; hasCommands {
+				t.Fatalf("session/new must not carry commands (official schema); got %v", res)
 			}
 			continue
 		}
-		if methodOf(m) == NotifyCommandsUpdate {
-			sawCommandsUpdate = true
+		// Commands arrive as an available_commands_update session/update variant.
+		if methodOf(m) == NotifySessionUpdate {
+			up := m["params"].(map[string]any)["update"].(map[string]any)
+			if k, _ := up["sessionUpdate"].(string); k == string(UpdateAvailableCommands) {
+				if cmds, _ := up["availableCommands"].([]any); len(cmds) == 2 {
+					sawCommandsUpdate = true
+				} else {
+					t.Fatalf("available_commands_update must carry two builtin commands, got %v", up)
+				}
+			}
 		}
 	}
 	if !sawCommandsUpdate {
-		t.Fatalf("available_commands_update notification missing before response")
+		t.Fatalf("available_commands_update session/update variant missing before response")
 	}
 
 	// prompt: plain free text defaults to /review through mock backend
@@ -193,7 +217,8 @@ func TestSessionNewPromptMockFlow(t *testing.T) {
 		"method":  MethodSessionPrompt,
 		"params": map[string]any{
 			"sessionId": sid,
-			"content":   []map[string]any{{"type": "text", "text": "please review"}},
+			// official schema names this field "prompt"
+			"prompt": []map[string]any{{"type": "text", "text": "please review"}},
 		},
 	}
 	raw, _ := json.Marshal(payload)
@@ -211,7 +236,7 @@ func TestSessionNewPromptMockFlow(t *testing.T) {
 		case methodOf(m) == NotifySessionUpdate:
 			up := m["params"].(map[string]any)["update"].(map[string]any)
 			if k, _ := up["sessionUpdate"].(string); k != string(UpdateAgentMessageChunk) {
-				t.Fatalf("unexpected update kind %v", up["sessionUpdate"])
+				continue // available_commands_update variant is fine here too
 			}
 			text := up["content"].(map[string]any)["text"].(string)
 			if strings.Contains(text, "finding") {
@@ -245,7 +270,7 @@ func TestCancelMidRunReturnsCancelledStop(t *testing.T) {
 		"method":  MethodSessionPrompt,
 		"params": map[string]any{
 			"sessionId": sid,
-			"content":   []map[string]any{{"type": "text", "text": "/review --from main --to dev"}},
+			"prompt":    []map[string]any{{"type": "text", "text": "/review --from main --to dev"}},
 		},
 	}
 	raw, _ := json.Marshal(promptLine)
@@ -290,7 +315,7 @@ func TestUnknownSlashCommandIsRejected(t *testing.T) {
 		"method":  MethodSessionPrompt,
 		"params": map[string]any{
 			"sessionId": sid,
-			"content":   []map[string]any{{"type": "text", "text": "/frobnicate now"}},
+			"prompt":    []map[string]any{{"type": "text", "text": "/frobnicate now"}},
 		},
 	})
 	h.send(t, string(raw))

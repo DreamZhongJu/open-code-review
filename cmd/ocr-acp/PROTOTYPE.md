@@ -66,6 +66,39 @@ workspace from `session/new.cwd`.
 | session/cancel | kills child process group (POSIX pgid kill; Windows direct kill) |
 | terminal rendering | findings markdown with severity/category/path/L-lines summary |
 
+## Protocol conformance
+
+Types in `acp/` were verified field-by-field against the official ACP v1
+schema (`agentclientprotocol/agent-client-protocol`,
+`agent-client-protocol-schema/src/v1/{agent,client}.rs`, pulled 2026-08-27).
+Notable corrections caught by that pass:
+
+- `session/prompt` carries `prompt: [ContentBlock]`, not `content`.
+- `session/new` replies with `sessionId` only; the command catalog is pushed
+  through the `session/update` notification as the `available_commands_update`
+  variant (`availableCommands`), matching `SessionUpdate::AvailableCommandsUpdate`.
+- Stop reasons are `end_turn`, `max_tokens`, `max_turn_requests`, `refusal`,
+  `cancelled` — the spec spells it **refusal**, not "refused".
+- `authenticate` answers with a plain `{}` success; an empty `authMethods`
+  array already declares "no auth required".
+- `initialize` replies also carry `agentInfo` (name/version) and
+  `requestCancellation: true`.
+
+Known deltas (documented, acceptable for a prototype):
+- `agentMessageChunk` updates omit the optional `messageId`; chunks still
+  concatenate in client order.
+- `promptCapabilities`, `mcpCapabilities` and session config option surfaces
+  are intentionally left at their zero values.
+- `_meta` extension blocks are not emitted.
+
+## Testing
+
+- Unit tests cover the wire protocol through an in-memory pipe harness
+  (handshake variants, unknown methods, unknown slash commands, the full mock
+  prompt flow with finding chunks, mid-run cancellation, tolerant decoding),
+  the argv assembly rules, and the multi-line JSON document assembler that
+  mirrors the real `ocr` `outputJSON` emission (indented, not compact).
+
 Testing hooks: `--ocr mock` produces deterministic two-finding output with 3
 progress steps, enabling full protocol tests with zero network/model access.
 

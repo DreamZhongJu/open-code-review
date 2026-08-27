@@ -4,10 +4,12 @@
 // Package types defines the subset of the Agent Client Protocol (ACP) v1
 // surface implemented by this prototype server, plus JSON-RPC 2.0 envelopes.
 //
-// Scope intentionally kept small for the OSPP prototype phase:
-// initialize, authenticate (unsupported reply), session/new, session/prompt,
-// session/cancel, and the agent -> client notifications
-// available_commands_update and session/update (agent_message_chunk only).
+// Field names, enum values, and shapes were verified against the official
+// ACP v1 schema (agentclientprotocol/agent-client-protocol, agent.rs and
+// client.rs), not inferred: stop reasons are refusal (not refused), prompt
+// carries prompt blocks (not content), and commands travel inside
+// session/update as the available_commands_update variant rather than in a
+// dedicated notification or in the session/new response.
 package acp
 
 import (
@@ -78,6 +80,13 @@ func (e *RPCError) Error() string {
 // initialize
 // ---------------------------------------------------------------------------
 
+// Implementation identifies an ACP client or agent (name/version pair), used
+// in initialize.client_info and initialize.agent_info.
+type Implementation struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+}
+
 // ClientCapabilities mirrors the fields of interest in ACP v1. The prototype
 // never issues fs/* callbacks itself (the wrapped ocr subprocess reads the
 // working tree directly), so these are recorded only for diagnostics.
@@ -93,6 +102,7 @@ type ClientCapabilities struct {
 type InitializeParams struct {
 	RawVersion         json.RawMessage    `json:"protocolVersion"`
 	ClientCapabilities ClientCapabilities `json:"clientCapabilities"`
+	ClientInfo         *Implementation    `json:"clientInfo,omitempty"`
 }
 
 // ProtocolVersion parses either numeric or string encodings of the version.
@@ -115,28 +125,26 @@ func (p *InitializeParams) ProtocolVersion() (int, error) {
 	return v, nil
 }
 
-// AgentCapabilities describes what this agent supports in the session scope.
-type AgentCapabilities struct {
-	LoadSession        bool                     `json:"loadSession"`
-	PromptCapabilities PromptCapabilitiesSubset `json:"promptCapabilities"`
+// PromptCapabilities advertises which ContentBlock shapes the agent accepts.
+// This server only consumes text blocks, so every capability stays false.
+type PromptCapabilities struct {
+	Image           bool `json:"image"`
+	Audio           bool `json:"audio"`
+	EmbeddedContext bool `json:"embeddedContext"`
 }
 
-// PromptCapabilitiesSubset advertises fine-grained prompt features. The
-// prototype relies on plain text blocks only, so most flags stay false.
-type PromptCapabilitiesSubset struct {
-	Audio         bool `json:"audio"`
-	Image         bool `json:"image"`
-	EmbeddedCtx   bool `json:"embeddedContext"`
-	Mention       bool `json:"meta"`
-	ResourceLinks bool `json:"resource_links"`
+// AgentCapabilities describes what this agent supports in the session scope.
+type AgentCapabilities struct {
+	LoadSession         bool               `json:"loadSession"`
+	PromptCapabilities  PromptCapabilities `json:"promptCapabilities"`
+	RequestCancellation bool               `json:"requestCancellation"`
 }
 
 // AuthMethod describes a login scheme. An empty (but non-null) array signals
 // "no authentication required", which the prototype declares explicitly.
 type AuthMethod struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
 // InitializeResult is the agent -> client handshake reply.
@@ -144,7 +152,13 @@ type InitializeResult struct {
 	ProtocolVersion   int               `json:"protocolVersion"`
 	AgentCapabilities AgentCapabilities `json:"agentCapabilities"`
 	AuthMethods       []AuthMethod      `json:"authMethods"`
+	AgentInfo         Implementation    `json:"agentInfo"`
 }
+
+// AuthenticateResult is the authenticate reply. With an empty authMethods
+// array the client should never send authenticate, but when it does the
+// protocol still expects a plain success envelope rather than an error.
+type AuthenticateResult struct{}
 
 // ---------------------------------------------------------------------------
 // session/new
@@ -158,45 +172,40 @@ type NewSessionParams struct {
 	McpServers json.RawMessage `json:"mcpServers,omitempty"`
 }
 
-// InputHint provides UI hints for slash command arguments.
-type InputHint struct {
+// UnstructuredCommandInput accepts the free text typed after a slash command.
+type UnstructuredCommandInput struct {
 	Hint string `json:"hint"`
 }
 
-// SlashCommand is a conversation shortcut exposed via
-// available_commands_update.
-type SlashCommand struct {
-	Name        string     `json:"name"`
-	Description string     `json:"description"`
-	InputHint   *InputHint `json:"inputHint,omitempty"`
+// AvailableCommand is a conversation shortcut advertised through the
+// available_commands_update session/update variant.
+type AvailableCommand struct {
+	Name        string                    `json:"name"`
+	Description string                    `json:"description"`
+	Input       *UnstructuredCommandInput `json:"input,omitempty"`
 }
 
 // BuiltinCommands returns the command catalog advertised for every session.
-func BuiltinCommands() []SlashCommand {
-	return []SlashCommand{
+func BuiltinCommands() []AvailableCommand {
+	return []AvailableCommand{
 		{
 			Name:        "/review",
 			Description: "Run an AI diff review on the current workspace (or a ref range)",
-			InputHint:   &InputHint{Hint: "[--from <ref>] [--to <ref>] [--commit <sha>]"},
+			Input:       &UnstructuredCommandInput{Hint: "[--from <ref>] [--to <ref>] [--commit <sha>]"},
 		},
 		{
 			Name:        "/scan",
 			Description: "Scan a repository tree without diff selection",
-			InputHint:   &InputHint{Hint: "[--repo <path>...]"},
+			Input:       &UnstructuredCommandInput{Hint: "[--repo <path>...]"},
 		},
 	}
 }
 
-// NewSessionResult is returned for session/new.
+// NewSessionResult is returned for session/new. Commands are NOT part of the
+// official response (schema: session_id, modes, config_options); the catalog
+// is pushed separately through the available_commands_update update.
 type NewSessionResult struct {
-	SessionID string         `json:"sessionId"`
-	Commands  []SlashCommand `json:"commands"`
-}
-
-// CommandsUpdateParams is the payload of available_commands_update.
-type CommandsUpdateParams struct {
-	SessionID string         `json:"sessionId"`
-	Commands  []SlashCommand `json:"commands"`
+	SessionID string `json:"sessionId"`
 }
 
 // ---------------------------------------------------------------------------
@@ -209,10 +218,11 @@ type ContentBlock struct {
 	Text string `json:"text,omitempty"`
 }
 
-// PromptParams wraps the user turn.
+// PromptParams wraps the user turn. The official schema names the field
+// "prompt" (a vector of ContentBlock), not "content".
 type PromptParams struct {
-	SessionID     string         `json:"sessionId"`
-	ContentBlocks []ContentBlock `json:"content"`
+	SessionID string         `json:"sessionId"`
+	Prompt    []ContentBlock `json:"prompt"`
 }
 
 // PromptResult terminates a prompt turn with a stop reason such as end_turn
@@ -221,22 +231,23 @@ type PromptResult struct {
 	StopReason string `json:"stopReason"`
 }
 
-// Terminal stop reasons per ACP v1.
+// Terminal stop reasons per ACP v1 (agent.rs StopReason, snake_case).
 const (
-	StopEndTurn   = "end_turn"
-	StopCancelled = "cancelled"
-	StopRefused   = "refused"
-	StopMaxTokens = "max_tokens"
+	StopEndTurn    = "end_turn"
+	StopMaxTokens  = "max_tokens"
+	StopMaxTurnReq = "max_turn_requests"
+	StopRefusal    = "refusal" // spec spells it refusal, not refused
+	StopCancelled  = "cancelled"
 )
 
 // SessionUpdateKind distinguishes the update variants inside a
 // session/update notification.
 type SessionUpdateKind string
 
-// The prototype only emits streaming assistant text. Tool-call and plan
-// updates remain future work tracked in PROTOTYPE.md.
+// The prototype emits streaming assistant text and the command catalog.
 const (
 	UpdateAgentMessageChunk SessionUpdateKind = "agent_message_chunk"
+	UpdateAvailableCommands SessionUpdateKind = "available_commands_update"
 )
 
 // ChunkUpdate carries one streamed text delta.
@@ -263,7 +274,32 @@ func NewTextChunk(sessionID, text string) UpdateChunkParams {
 	}
 }
 
-// CancelParams identifies the prompt turn to interrupt.
+// CommandsUpdate is the available_commands_update variant payload.
+type CommandsUpdate struct {
+	SessionUpdate     SessionUpdateKind  `json:"sessionUpdate"`
+	AvailableCommands []AvailableCommand `json:"availableCommands"`
+}
+
+// UpdateCommandsParams is a session/update notification advertising the
+// slash command catalog, matching the official AvailableCommandsUpdate shape.
+type UpdateCommandsParams struct {
+	SessionID string         `json:"sessionId"`
+	Update    CommandsUpdate `json:"update"`
+}
+
+// NewCommandsUpdate builds the available_commands_update event.
+func NewCommandsUpdate(sessionID string, cmds []AvailableCommand) UpdateCommandsParams {
+	return UpdateCommandsParams{
+		SessionID: sessionID,
+		Update: CommandsUpdate{
+			SessionUpdate:     UpdateAvailableCommands,
+			AvailableCommands: cmds,
+		},
+	}
+}
+
+// CancelParams identifies the prompt turn to interrupt (session/cancel
+// notification, schema CancelNotification).
 type CancelParams struct {
 	SessionID string `json:"sessionId"`
 }

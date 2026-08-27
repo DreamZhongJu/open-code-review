@@ -192,20 +192,28 @@ func (w *Wrapper) RunReview(parent context.Context, opts ReviewOpts) (<-chan Eve
 		defer close(scannerDone)
 		scanner := bufio.NewScanner(bufio.NewReaderSize(stdout, 1<<20))
 		scanner.Buffer(make([]byte, 0, 64*1024), 4<<20)
+		var st docState
 		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" {
+			doc, prog := st.Feed(scanner.Text())
+			if prog != "" {
+				// Progress lines are cosmetic: never let a chatty child block
+				// the protocol loop, so a full buffer drops the chunk.
+				select {
+				case out <- Event{Type: EventProgress, Text: truncate(prog, 200)}:
+				default:
+				}
 				continue
 			}
-			if !strings.HasPrefix(line, "{") {
-				out <- Event{Type: EventProgress, Text: truncate(line, 200)}
-				continue
-			}
-			var res OCRResult
-			if err := json.Unmarshal([]byte(line), &res); err == nil {
-				lastParsed = &res
-			} else {
-				out <- Event{Type: EventProgress, Text: truncate(line, 200)}
+			if doc != "" {
+				var res OCRResult
+				if err := json.Unmarshal([]byte(doc), &res); err == nil {
+					lastParsed = &res
+				} else {
+					select {
+					case out <- Event{Type: EventProgress, Text: "(unparseable json output) " + truncate(doc, 200)}:
+					default:
+					}
+				}
 			}
 		}
 	}()
@@ -448,4 +456,87 @@ func ResolveCwd(cwd string) (string, error) {
 // without breaking this adapter.
 func tolerantUnmarshal(raw string, dst *OCRResult) error {
 	return json.Unmarshal([]byte(raw), dst)
+}
+
+// maxJSONDoc is the largest stdout document the parser will accumulate before
+// giving up. Real review runs emit a couple of hundred KB at most; the ceiling
+// only guards against a corrupted stream.
+const maxJSONDoc = 32 << 20 // 32 MiB
+
+// docState incrementally assembles JSON documents from lines of child stdout.
+//
+// The ocr CLI prints its jsonOutput with SetIndent("", "  ") which spans many
+// lines, while a mock or future compact format may arrive on a single line.
+// docState accumulates from the first line starting with '{' until braces
+// balance (ignoring braces inside string literals), then reports the complete
+// document. Every other line is reported back as plain progress text.
+type docState struct {
+	buf   bytes.Buffer
+	depth int
+	inDoc bool
+}
+
+// Feed consumes one stdout line and returns either a complete JSON document
+// (possibly on the same call that started it), or human-readable progress
+// text when the line was not part of an opening document. At most one of the
+// returned values is non-empty on any call.
+func (d *docState) Feed(line string) (doc string, progress string) {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return "", ""
+	}
+	if !d.inDoc {
+		if !strings.HasPrefix(trimmed, "{") {
+			return "", line
+		}
+		d.inDoc = true
+		d.buf.Reset()
+		d.depth = braceDepth(line)
+		d.buf.WriteString(line)
+		d.buf.WriteByte('\n')
+		if d.depth <= 0 {
+			out := d.buf.String()
+			d.inDoc = false
+			return out, ""
+		}
+		return "", ""
+	}
+	if d.buf.Len() > maxJSONDoc {
+		d.inDoc = false
+		return "", "(json document too large; discarded)"
+	}
+	d.depth += braceDepth(line)
+	d.buf.WriteString(line)
+	d.buf.WriteByte('\n')
+	if d.depth <= 0 {
+		out := d.buf.String()
+		d.inDoc = false
+		return out, ""
+	}
+	return "", ""
+}
+
+// braceDepth counts unclosed '{' outside string literals so that braces
+// appearing inside JSON string values (e.g. code snippets in comments) do not
+// disturb the accumulator's completion signal.
+func braceDepth(s string) int {
+	depth := 0
+	inString := false
+	escaped := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case escaped:
+			escaped = false
+		case inString && c == '\\':
+			escaped = true
+		case c == '"':
+			inString = !inString
+		case !inString && c == '{':
+			depth++
+		case !inString && c == '}':
+			depth--
+		}
+	}
+	return depth
 }

@@ -98,8 +98,10 @@ func (s *Server) dispatch(req *Request) (any, *RPCError) {
 	case MethodInitialize:
 		return s.handleInitialize(req.Params)
 	case MethodAuthenticate:
-		return nil, &RPCError{Code: CodeInvalidRequest,
-			Message: "no auth methods available: this agent requires no authentication"}
+		// Official schema: with an empty authMethods array the client should
+		// never call authenticate, but a plain success reply keeps the
+		// handshake valid if one arrives anyway.
+		return AuthenticateResult{}, nil
 	case MethodSessionNew:
 		return s.handleSessionNew(req.Params)
 	case MethodSessionPrompt:
@@ -137,9 +139,14 @@ func (s *Server) handleInitialize(raw json.RawMessage) (any, *RPCError) {
 			Message: fmt.Sprintf("unsupported protocolVersion %s: this prototype speaks ACP v1 only", strings.TrimSpace(string(p.RawVersion)))}
 	}
 	res := InitializeResult{
-		ProtocolVersion:   ACPVersionV1,
-		AgentCapabilities: AgentCapabilities{},
-		AuthMethods:       []AuthMethod{}, // explicit empty array = no auth required
+		ProtocolVersion: ACPVersionV1,
+		AgentCapabilities: AgentCapabilities{
+			LoadSession:         false,
+			PromptCapabilities:  PromptCapabilities{},
+			RequestCancellation: true,
+		},
+		AuthMethods: []AuthMethod{}, // explicit empty array = no auth required
+		AgentInfo:   Implementation{Name: "ocr-acp", Version: "0.1.0-prototype"},
 	}
 	return res, nil
 }
@@ -164,10 +171,12 @@ func (s *Server) handleSessionNew(raw json.RawMessage) (any, *RPCError) {
 	cmds := BuiltinCommands()
 	s.mu.Unlock()
 
-	// Client UX hint: advertise slash commands eagerly (spec also allows on demand).
-	_ = s.conn.SendNotification(NotifyCommandsUpdate, CommandsUpdateParams{SessionID: id, Commands: cmds})
+	// Commands travel inside a session/update notification as the
+	// available_commands_update variant; they are not part of the
+	// session/new response (verified against the official schema).
+	_ = s.conn.SendNotification(NotifySessionUpdate, NewCommandsUpdate(id, cmds))
 
-	return NewSessionResult{SessionID: id, Commands: cmds}, nil
+	return NewSessionResult{SessionID: id}, nil
 }
 
 // handlePromptAsync validates and launches the turn, returning only setup
@@ -184,7 +193,7 @@ func (s *Server) handlePromptAsync(req *Request) *RPCError {
 		return &RPCError{Code: CodeInvalidParams, Message: fmt.Sprintf("unknown sessionId %q", p.SessionID)}
 	}
 
-	text := joinedText(p.ContentBlocks)
+	text := joinedText(p.Prompt)
 	intent, perr := parseIntent(text)
 	if perr != nil {
 		return perr
@@ -307,7 +316,7 @@ func (s *Server) streamTurn(ctx context.Context, sessionID, cwd string, it *turn
 	})
 	if err != nil {
 		_ = s.conn.SendNotification(NotifySessionUpdate, NewTextChunk(sessionID, "[error] "+err.Error()))
-		it.stopReason = StopRefused
+		it.stopReason = StopRefusal
 		return
 	}
 	var final *wrapper.OCRResult

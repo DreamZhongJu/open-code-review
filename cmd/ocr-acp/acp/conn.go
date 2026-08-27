@@ -99,12 +99,10 @@ func (c *Conn) write(v any) error {
 
 // Convenience method-name constants shared by dispatcher and tests.
 const (
-	MethodInitialize            = "initialize"
-	MethodAuthenticate          = "authenticate"
-	MethodSessionNew            = "session/new"
-	MethodSessionPrompt         = "session/prompt"
-	MethodSessionCancel         = "session/cancel"
-	NotifyCommandsUpdate        = "available_commands_update"
-	NotifySessionUpdate         = "session/update"
-	UpdateKindAgentMessageChunk = "agent_message_chunk"
+	MethodInitialize    = "initialize"
+	MethodAuthenticate  = "authenticate"
+	MethodSessionNew    = "session/new"
+	MethodSessionPrompt = "session/prompt"
+	MethodSessionCancel = "session/cancel"
+	NotifySessionUpdate = "session/update"
 )
