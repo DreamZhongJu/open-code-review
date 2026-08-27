@@ -641,10 +641,7 @@ func (a *Agent) dispatchSubtasks(ctx context.Context) ([]model.LlmComment, error
 	}
 
 	sem := make(chan struct{}, concurrency)
-	timeout := time.Duration(a.args.ConcurrentTaskTimeout) * time.Minute
-	if timeout > 0 && a.args.Template.ReviewRounds() > 1 {
-		timeout = timeout + timeout/2
-	}
+	timeout := time.Duration(a.args.ConcurrentTaskTimeout) * time.Minute * time.Duration(a.args.Template.ReviewRounds())
 
 	var dispatched int64
 dispatchLoop:
