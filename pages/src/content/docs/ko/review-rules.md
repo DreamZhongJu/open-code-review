@@ -158,7 +158,7 @@ diff 단계에서 일어납니다.
 | `**/*.{kt}` | `kotlin.md` |
 | `**/*.rs` | `rust.md` |
 | `**/*.R` | `r.md` |
-| `**/*.{cpp,cc,hpp}` | `cpp.md` |
+| `**/*.{cpp,cc,cxx,hpp,hxx}` | `cpp.md` |
 | `**/*.c` | `c.md` |
 | `**/*.{py,ipynb}` | `python.md` — Python 소스. |
 | `**/*.{php,phtml}` | `php.md` — PHP 소스와 PHP 템플릿. |
