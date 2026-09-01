@@ -22,7 +22,7 @@
     "**/*.{ts,js,tsx,jsx}": "ts_js_tsx_jsx.md",
     "**/*.{kt}": "kotlin.md",
     "**/*.rs": "rust.md",
-    "**/*.{cpp,cc,hpp}": "cpp.md",
+    "**/*.{cpp,cc,cxx,hpp,hxx}": "cpp.md",
     "**/*.c": "c.md",
     "**/*.{py,ipynb}": "python.md",
     "**/*.{php,phtml}": "php.md",
